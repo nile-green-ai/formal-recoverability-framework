@@ -183,6 +183,9 @@ def causal_recoverability(
 ) -> dict[str, Any]:
     """
     v1.2.2 Section 3.3 causal recoverability on held-out test set.
+
+    NOTE: the baseline is computed from the held-out test labels (oracle null),
+    which is stricter than a deployable training-set baseline.
     """
     if len(y_true) != len(y_pred) or len(y_true) == 0:
         raise ValueError("y_true and y_pred must be non-empty of equal length.")
@@ -228,7 +231,7 @@ def _solve_ridge_1d(
     lam: float = 1e-2,
     rank_tol: float = 1e-12,
 ) -> list[float]:
-    """Fit weights w (intercept at index 0) with explicit rank-deficiency warning."""
+    """Fit weights w (intercept at index 0). Raises on a singular normal equation."""
     p = len(x_rows[0]) + 1
     xtx = [[0.0] * p for _ in range(p)]
     xty = [0.0] * p
@@ -249,12 +252,10 @@ def _solve_ridge_1d(
         piv = max(range(col, p), key=lambda r: abs(mat[r][col]))
         mat[col], mat[piv] = mat[piv], mat[col]
         if abs(mat[col][col]) <= rank_tol:
-            warnings.warn(
-                f"Near-singular normal equation pivot at column {col}; ridge solution may be non-unique.",
-                RuntimeWarning,
-                stacklevel=2,
+            raise ValueError(
+                f"Singular normal equation at column {col}; increase ridge_lambda or "
+                "remove degenerate features."
             )
-            continue
         inv = 1.0 / mat[col][col]
         for c in range(col, p + 1):
             mat[col][c] *= inv
@@ -291,8 +292,11 @@ def global_recoverability_mse(
     if n_test == 0 or not hid_test[0]:
         return {"R_g": COMPLETE_OBSERVATION, "E_model": None, "E_null": None}
 
-    d_h = len(hid_test[0])
     n_train = len(hid_train)
+    if n_train == 0:
+        raise ValueError("hid_train must be non-empty when hid_test is non-empty.")
+
+    d_h = len(hid_test[0])
     mean_h = [
         sum(float(row[c]) for row in hid_train) / n_train
         for c in range(d_h)
@@ -356,39 +360,44 @@ def _r2_score(y_true: list[float], y_pred: list[float], eps: float = 1e-12) -> f
     return 1.0 - (ss_res / ss_tot)
 
 
-def _shuffled_kfold_cv_r2(
-    x_rows: list[list[float]],
-    y_vals: list[float],
-    rng: random.Random,
-    n_splits: int = 5,
-    ridge_lambda: float = 1e-2,
-) -> float:
-    """Shuffled k-fold cross-validated R^2 so input ordering never biases folds."""
-    n = len(y_vals)
-    k = min(n_splits, n)
-    if k < 2:
-        return 0.0
-
+def _make_folds(n: int, k: int, rng: random.Random) -> list[int]:
+    """Shuffled fold assignment: returns a fold id in [0, k) for each of n rows."""
+    k = min(k, n)
     perm = list(range(n))
     rng.shuffle(perm)
+    ids = [0] * n
+    for pos, i in enumerate(perm):
+        ids[i] = pos % k
+    return ids
+
+
+def _cv_r2_folds(
+    x_rows: list[list[float]],
+    y_vals: list[float],
+    fold_ids: list[int],
+    ridge_lambda: float = 1e-2,
+) -> float:
+    """
+    Cross-validated R^2 using a caller-supplied fold assignment, so competing models
+    can be compared on identical folds (paired) and bootstrap duplicates can be kept
+    inside a single fold (no train/validation leakage).
+    """
+    if max(fold_ids) < 1:
+        return 0.0
 
     all_true: list[float] = []
     all_pred: list[float] = []
 
-    for fold in range(k):
-        val_positions = {pos for pos in range(fold, n, k)}
-        val_idx = {perm[pos] for pos in val_positions}
-        tr_x = [x_rows[i] for i in range(n) if i not in val_idx]
-        tr_y = [y_vals[i] for i in range(n) if i not in val_idx]
-        va_x = [x_rows[i] for i in range(n) if i in val_idx]
-        va_y = [y_vals[i] for i in range(n) if i in val_idx]
-
-        if not tr_x or not va_x:
+    for fold in range(max(fold_ids) + 1):
+        tr = [i for i, g in enumerate(fold_ids) if g != fold]
+        va = [i for i, g in enumerate(fold_ids) if g == fold]
+        if not tr or not va:
             continue
-        w = _solve_ridge_1d(tr_x, tr_y, lam=ridge_lambda)
-        preds = _predict_ridge_1d(w, va_x)
-        all_true.extend(va_y)
-        all_pred.extend(preds)
+        w = _solve_ridge_1d(
+            [x_rows[i] for i in tr], [y_vals[i] for i in tr], lam=ridge_lambda
+        )
+        all_pred.extend(_predict_ridge_1d(w, [x_rows[i] for i in va]))
+        all_true.extend(y_vals[i] for i in va)
 
     if len(all_true) < 2:
         return 0.0
@@ -423,8 +432,15 @@ def run_section5_falsification_harness(
 ) -> dict[str, Any]:
     """
     v1.2.2 Section 5 five-condition falsification & control harness.
-    Practical-significance floor (0.01) is evaluated on the bootstrap median of
-    incremental Delta R^2_CV alongside the 95% percentile bootstrap CI.
+
+    CV design: every replicate draws ONE fold assignment over the original rows and
+    reuses it for all three models (R-only, Z-only, Z+R), so the incremental
+    Delta R^2_CV is paired. Bootstrap rows inherit the fold of their source row, so
+    duplicates never straddle train/validation.
+
+    Condition 5 passes only if the 95% percentile CI of incremental Delta R^2_CV has
+    a strictly positive lower bound AND the (signed) bootstrap median meets the
+    practical-significance floor. A significantly negative Delta R^2 does not pass.
     """
     n = len(delta_resp_samples)
     if not (len(delta_r_samples) == n and len(delta_z_int_samples) == n):
@@ -463,15 +479,12 @@ def run_section5_falsification_harness(
 
     rng = random.Random(seed)
     full_dz_plus_dr = [delta_z_int_samples[i] + delta_r_samples[i] for i in range(n)]
-    r2_r_full_cv = _shuffled_kfold_cv_r2(
-        delta_r_samples, delta_resp_samples, rng=rng, n_splits=n_splits, ridge_lambda=ridge_lambda
-    )
-    r2_z_full_cv = _shuffled_kfold_cv_r2(
-        delta_z_int_samples, delta_resp_samples, rng=rng, n_splits=n_splits, ridge_lambda=ridge_lambda
-    )
-    r2_zr_full_cv = _shuffled_kfold_cv_r2(
-        full_dz_plus_dr, delta_resp_samples, rng=rng, n_splits=n_splits, ridge_lambda=ridge_lambda
-    )
+
+    # Full-data point estimates on one shared (paired) fold assignment.
+    full_folds = _make_folds(n, n_splits, rng)
+    r2_r_full_cv = _cv_r2_folds(delta_r_samples, delta_resp_samples, full_folds, ridge_lambda)
+    r2_z_full_cv = _cv_r2_folds(delta_z_int_samples, delta_resp_samples, full_folds, ridge_lambda)
+    r2_zr_full_cv = _cv_r2_folds(full_dz_plus_dr, delta_resp_samples, full_folds, ridge_lambda)
     delta_r2_full_cv = r2_zr_full_cv - r2_z_full_cv
 
     r2_r_boot: list[float] = []
@@ -479,14 +492,17 @@ def run_section5_falsification_harness(
 
     for _ in range(n_bootstrap):
         boot_idx = [rng.randrange(n) for _ in range(n)]
+        orig_folds = _make_folds(n, n_splits, rng)
+        b_folds = [orig_folds[i] for i in boot_idx]
+
         b_dr = [delta_r_samples[i] for i in boot_idx]
         b_dz = [delta_z_int_samples[i] for i in boot_idx]
-        b_dz_plus_dr = [delta_z_int_samples[i] + delta_r_samples[i] for i in boot_idx]
+        b_dz_plus_dr = [full_dz_plus_dr[i] for i in boot_idx]
         b_y = [delta_resp_samples[i] for i in boot_idx]
 
-        r2_only_r = _shuffled_kfold_cv_r2(b_dr, b_y, rng=rng, n_splits=n_splits, ridge_lambda=ridge_lambda)
-        r2_base_z = _shuffled_kfold_cv_r2(b_dz, b_y, rng=rng, n_splits=n_splits, ridge_lambda=ridge_lambda)
-        r2_joint_zr = _shuffled_kfold_cv_r2(b_dz_plus_dr, b_y, rng=rng, n_splits=n_splits, ridge_lambda=ridge_lambda)
+        r2_only_r = _cv_r2_folds(b_dr, b_y, b_folds, ridge_lambda)
+        r2_base_z = _cv_r2_folds(b_dz, b_y, b_folds, ridge_lambda)
+        r2_joint_zr = _cv_r2_folds(b_dz_plus_dr, b_y, b_folds, ridge_lambda)
 
         r2_r_boot.append(r2_only_r)
         delta_r2_boot.append(r2_joint_zr - r2_base_z)
@@ -532,17 +548,17 @@ def run_section5_falsification_harness(
             "cond5_ci95": (ci5_lo, ci5_hi),
         }
 
-    ci5_includes_zero = (ci5_lo <= 0.0) and (0.0 <= ci5_hi)
-    below_practical_floor = abs(delta_r2_boot_median) < practical_floor
+    ci5_lower_not_positive = ci5_lo <= 0.0
+    below_practical_floor = delta_r2_boot_median < practical_floor  # signed, no abs()
 
-    if ci5_includes_zero or below_practical_floor:
+    if ci5_lower_not_positive or below_practical_floor:
         return {
             "classification": "hidden_state_dependence",
             "reason": "cond5_or_triggered",
             "bootstrap_ci_method": BOOTSTRAP_CI_METHOD,
             "cond5_triggers": {
-                "ci95_includes_zero": ci5_includes_zero,
-                "abs_delta_r2_boot_median_below_floor": below_practical_floor,
+                "ci95_lower_not_positive": ci5_lower_not_positive,
+                "delta_r2_boot_median_below_floor": below_practical_floor,
             },
             "cond4_r2_full_cv": r2_r_full_cv,
             "cond4_r2_boot_median": r2_boot_median,
@@ -606,6 +622,13 @@ def _run_verification_assertions() -> None:
     rg_full_obs = global_recoverability_mse([[1.0]], [], [[1.0]], [])
     assert rg_full_obs["R_g"] == COMPLETE_OBSERVATION
 
+    # 6b. Non-empty hid_test with empty hid_train must raise, not divide by zero
+    try:
+        global_recoverability_mse([[1.0]], [], [[1.0]], [[1.0]])
+        raise AssertionError("expected ValueError for empty hid_train")
+    except ValueError:
+        pass
+
     # 7. Retention eta_X domain & sign-crossing
     assert recoverability_retention(0.0, 0.5)["status"] == NON_POSITIVE_BASELINE
     assert recoverability_retention(-0.2, 0.1)["status"] == NON_POSITIVE_BASELINE
@@ -622,13 +645,11 @@ def _run_verification_assertions() -> None:
     )
     assert z_var["classification"] == "inconclusive" and z_var["reason"] == "zero_variance_target"
 
-    # 9. Tightened hidden_state_dependence test: z_int explains y strongly,
-    # r_list has strong marginal correlation with y (so Condition 4 passes)
-    # but zero incremental lift once z_int is included (Condition 5 fires).
+    # 9. hidden_state_dependence: z_int explains y strongly, r correlates with y
+    # marginally (Condition 4 passes) but adds no lift once z_int is included.
     rng = random.Random(2026)
     n_pts = 80
     z_list = [[rng.uniform(-2.0, 2.0)] for _ in range(n_pts)]
-    # r correlated with z + small independent component so marginal R^2 > 0
     r_list = [[0.85 * z_list[i][0] + 0.35 * rng.uniform(-1.0, 1.0)] for i in range(n_pts)]
     y_hidden = [3.0 * z_list[i][0] + 0.02 * rng.gauss(0.0, 1.0) for i in range(n_pts)]
 
@@ -655,7 +676,7 @@ def _run_verification_assertions() -> None:
     )
     assert res_lin["classification"] == "irreducible_recoverability_effect"
 
-    # 10b. Nonlinear positive-path test (strong cubic/tanh component in r beyond z)
+    # 10b. Nonlinear positive-path test (strong cubic component in r beyond z)
     r_indep = [[rng.uniform(-2.0, 2.0)] for _ in range(n_pts)]
     y_nonlin = [
         0.5 * z_list[i][0] + 1.8 * (r_indep[i][0] ** 3) + 0.05 * rng.gauss(0.0, 0.3)
@@ -671,8 +692,30 @@ def _run_verification_assertions() -> None:
     )
     assert res_nonlin["classification"] == "irreducible_recoverability_effect"
 
+    # 11. Leakage sanity: pure noise must never pass Condition 4
+    noise_r = [[rng.gauss(0.0, 1.0)] for _ in range(n_pts)]
+    noise_z = [[rng.gauss(0.0, 1.0)] for _ in range(n_pts)]
+    noise_y = [rng.gauss(0.0, 1.0) for _ in range(n_pts)]
+    res_noise = run_section5_falsification_harness(
+        delta_r_samples=noise_r,
+        delta_z_int_samples=noise_z,
+        delta_resp_samples=noise_y,
+        max_rel_energy_diff=0.002,
+        max_rel_state_diff=0.005,
+        n_bootstrap=300,
+    )
+    assert res_noise["classification"] == "falsified", res_noise
+
+    # 12. Fold pairing: identical inputs + identical folds -> identical CV R^2
+    folds = _make_folds(n_pts, 5, random.Random(7))
+    a = _cv_r2_folds(r_list, y_lin, folds)
+    b = _cv_r2_folds(r_list, y_lin, folds)
+    assert a == b
+
     print("All v1.2.2 default-path & Section 5 harness assertions passed.")
 
 
 if __name__ == "__main__":
     _run_verification_assertions()
+
+
