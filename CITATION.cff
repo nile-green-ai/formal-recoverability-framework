@@ -1,0 +1,12 @@
+cff-version: 1.2.0
+message: "If you use this specification or reference implementation, please cite it as below."
+title: "Formal Recoverability Framework (v1.2.2): Specification and Default Reference Implementation"
+version: "1.2.2"
+date-released: "2026-11-21"
+license: MIT
+repository-code: "https://github.com/nile-green-ai/formal-recoverability-framework"
+url: "https://bapxai.com"
+authors:
+  - family-names: "Green"
+    given-names: "Nile"
+    orcid: "https://orcid.org/0009-0007-3629-6404"
